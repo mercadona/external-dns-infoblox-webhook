@@ -1315,3 +1315,52 @@ func TestInfobloxApplyChangesUpsertsMissingRecord(t *testing.T) {
 		endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeA, "1.2.3.4"),
 	})
 }
+
+// The TXT branch of recordSet normalises its target in place with strconv.Unquote, to
+// match the Infoblox API stripping the enclosing quotes of a value without whitespace.
+// Running recordSet twice for one change therefore strips twice, and a TXT whose value
+// is itself a quoted string loses a layer. The property this asserts is parity: an
+// upsert must store exactly what a plain create of the same endpoint stores.
+func TestInfobloxApplyChangesUpsertKeepsQuotedTXTIntact(t *testing.T) {
+	quoted := `"\"token\""`
+	txt := func() *endpoint.Endpoint {
+		return endpoint.NewEndpoint("quoted.example.com", endpoint.RecordTypeTXT, quoted)
+	}
+	newClient := func() mockIBConnector {
+		return mockIBConnector{
+			mockInfobloxZones: &[]ibclient.ZoneAuth{
+				createMockInfobloxZone("example.com"),
+			},
+			mockInfobloxObjects: &[]ibclient.IBObject{},
+			txtNotFound:         true,
+		}
+	}
+	apply := func(t *testing.T, client *mockIBConnector, changes *plan.Changes) {
+		t.Helper()
+		providerCfg := newInfobloxProvider(
+			endpoint.NewDomainFilter([]string{"example.com"}),
+			provider.NewZoneIDFilter([]string{""}), "", false, false, client)
+		if err := providerCfg.ApplyChanges(context.Background(), changes); err != nil {
+			t.Fatalf("ApplyChanges returned an error: %v", err)
+		}
+		if len(client.createdEndpoints) != 1 {
+			t.Fatalf("expected exactly one created record, got %v", client.createdEndpoints)
+		}
+	}
+
+	created := newClient()
+	apply(t, &created, &plan.Changes{Create: []*endpoint.Endpoint{txt()}})
+
+	// Same endpoint, but reached through the upsert: an UPDATE of a record the zone
+	// does not hold. Matched UpdateOld/UpdateNew keeps CountDiff from turning it into
+	// a create of its own.
+	upserted := newClient()
+	apply(t, &upserted, &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{txt()},
+		UpdateNew: []*endpoint.Endpoint{txt()},
+	})
+
+	if want, got := created.createdEndpoints[0].Targets[0], upserted.createdEndpoints[0].Targets[0]; want != got {
+		t.Errorf("upsert stored %q, a plain create of the same endpoint stores %q", got, want)
+	}
+}

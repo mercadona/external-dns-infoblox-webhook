@@ -740,6 +740,10 @@ func (p *Provider) findReverseZone(zones []*ibclient.ZoneAuth, name string) *ibc
 // tolerated NotFoundError -- otherwise it leaks out through buildRecord and the change
 // fails with "could not build record: not found".
 func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet infobloxRecordSet, err error) {
+	// Work on a copy. The TXT branch below rewrites Targets in place, so calling this
+	// twice for one change -- which the upsert in submitChanges does -- would strip a
+	// second layer of quotes from a value that has them.
+	ep = ep.DeepCopy()
 	var ttl uint32
 	var startTime time.Time
 	if ep.RecordTTL.IsConfigured() {

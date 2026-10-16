@@ -1267,13 +1267,12 @@ func validateEndpoints(t *testing.T, endpoints []*endpoint.Endpoint, expected []
 	assert.True(t, SameEndpoints(endpoints, expected), "actual and expected endpoints don't match. %s:%s", endpoints, expected)
 }
 
-// The TXT registry of ExternalDNS emits the ownership record of every updated
-// endpoint as UpdateNew, whether or not that record is already in the zone. A zone
-// holding the A record but not its TXT -- what a half-finished batch, or an older
-// registry format, leaves behind -- therefore arrives here as an UPDATE of a record
-// that does not exist. The in-tree providers create it. Before this, the lookup's
-// NotFoundError leaked out of recordSet through its named return and the change
-// failed with "could not build record: not found" on every reconcile, for good.
+// A zone holding the A record of an endpoint but not its type-prefixed ownership TXT
+// -- what an interrupted batch, or the registry's format change, leaves behind -- reaches
+// the provider as an UPDATE of a record that is not there: ownership still resolves
+// through the legacy TXT, so the registry emits the missing one as UpdateNew. Before
+// this, the lookup's NotFoundError leaked out of recordSet through its named return and
+// the change failed with "could not build record: not found" on every reconcile, for good.
 func TestInfobloxApplyChangesUpsertsMissingRecord(t *testing.T) {
 	client := mockIBConnector{
 		mockInfobloxZones: &[]ibclient.ZoneAuth{

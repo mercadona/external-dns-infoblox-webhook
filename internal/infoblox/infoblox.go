@@ -428,12 +428,10 @@ func (p *Provider) submitChanges(changes []*infobloxChange) error {
 				metrics.TotalApiCalls.Inc()
 			case infobloxUpdate:
 				if refId == "" {
-					// Upsert. ExternalDNS does not promise that an UpdateNew record is
-					// already in the zone -- its TXT registry emits the ownership records
-					// for every updated endpoint whether they exist or not -- and the
-					// in-tree providers create what is missing. Rebuild the record in its
-					// create shape: that path sets the View, which Infoblox needs to find
-					// the parent zone and rejects on an update.
+					// Upsert: the TXT registry can emit an UpdateNew for an ownership
+					// record that is not in the zone. Rebuild it in its create shape --
+					// that path sets the View, which Infoblox needs to find the parent
+					// zone and rejects on an update.
 					var createSet infobloxRecordSet
 					if createSet, actionErr = p.recordSet(change.Endpoint, false); actionErr == nil {
 						_, actionErr = p.client.CreateObject(createSet.obj)

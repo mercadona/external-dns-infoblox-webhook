@@ -47,6 +47,9 @@ type mockIBConnector struct {
 	updatedEndpoints    []*endpoint.Endpoint
 	getObjectRequests   []*getObjectRequest
 	requestBuilder      ExtendedRequestBuilder
+	// txtNotFound makes a TXT lookup that matches nothing answer with the
+	// NotFoundError the real WAPI client returns, instead of an empty result.
+	txtNotFound bool
 }
 
 type getObjectRequest struct {
@@ -372,6 +375,9 @@ func (client *mockIBConnector) GetObject(obj ibclient.IBObject, ref string, quer
 			res.(*pagingResponseStruct[ibclient.RecordTXT]).Result = result
 		} else {
 			*res.(*[]ibclient.RecordTXT) = result
+		}
+		if client.txtNotFound && len(result) == 0 {
+			return ibclient.NewNotFoundError("no TXT record found")
 		}
 	case recordPtr:
 		var result []ibclient.RecordPTR
@@ -1260,4 +1266,101 @@ func (r *mockRequestor) SendRequest(req *http.Request) (res []byte, err error) {
 
 func validateEndpoints(t *testing.T, endpoints []*endpoint.Endpoint, expected []*endpoint.Endpoint) {
 	assert.True(t, SameEndpoints(endpoints, expected), "actual and expected endpoints don't match. %s:%s", endpoints, expected)
+}
+
+// A zone holding the A record of an endpoint but not its type-prefixed ownership TXT
+// -- what an interrupted batch, or the registry's format change, leaves behind -- reaches
+// the provider as an UPDATE of a record that is not there: ownership still resolves
+// through the legacy TXT, so the registry emits the missing one as UpdateNew. Before
+// this, the lookup's NotFoundError leaked out of recordSet through its named return and
+// the change failed with "could not build record: not found" on every reconcile, for good.
+func TestInfobloxApplyChangesUpsertsMissingRecord(t *testing.T) {
+	client := mockIBConnector{
+		mockInfobloxZones: &[]ibclient.ZoneAuth{
+			createMockInfobloxZone("example.com"),
+		},
+		mockInfobloxObjects: &[]ibclient.IBObject{
+			createMockInfobloxObject("foo.example.com", endpoint.RecordTypeA, "1.2.3.4"),
+		},
+		txtNotFound: true,
+	}
+
+	providerCfg := newInfobloxProvider(
+		endpoint.NewDomainFilter([]string{"example.com"}),
+		provider.NewZoneIDFilter([]string{""}), "", false, false, &client)
+
+	// Same targets on both sides, so CountDiff keeps these as updates rather than
+	// turning them into creates -- which is the shape the TXT registry produces for
+	// an endpoint it already owns.
+	err := providerCfg.ApplyChanges(context.Background(), &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{
+			endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeA, "1.2.3.4"),
+			endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeTXT, "tag"),
+		},
+		UpdateNew: []*endpoint.Endpoint{
+			endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeA, "1.2.3.4"),
+			endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeTXT, "tag"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyChanges returned an error: %v", err)
+	}
+
+	// The TXT is not in the zone, so it is created ...
+	validateEndpoints(t, client.createdEndpoints, []*endpoint.Endpoint{
+		endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeTXT, "tag"),
+	})
+	// ... while the A record, which is, is updated as before.
+	validateEndpoints(t, client.updatedEndpoints, []*endpoint.Endpoint{
+		endpoint.NewEndpoint("foo.example.com", endpoint.RecordTypeA, "1.2.3.4"),
+	})
+}
+
+// The TXT branch of recordSet normalises its target in place with strconv.Unquote, to
+// match the Infoblox API stripping the enclosing quotes of a value without whitespace.
+// Running recordSet twice for one change therefore strips twice, and a TXT whose value
+// is itself a quoted string loses a layer. The property this asserts is parity: an
+// upsert must store exactly what a plain create of the same endpoint stores.
+func TestInfobloxApplyChangesUpsertKeepsQuotedTXTIntact(t *testing.T) {
+	quoted := `"\"token\""`
+	txt := func() *endpoint.Endpoint {
+		return endpoint.NewEndpoint("quoted.example.com", endpoint.RecordTypeTXT, quoted)
+	}
+	newClient := func() mockIBConnector {
+		return mockIBConnector{
+			mockInfobloxZones: &[]ibclient.ZoneAuth{
+				createMockInfobloxZone("example.com"),
+			},
+			mockInfobloxObjects: &[]ibclient.IBObject{},
+			txtNotFound:         true,
+		}
+	}
+	apply := func(t *testing.T, client *mockIBConnector, changes *plan.Changes) {
+		t.Helper()
+		providerCfg := newInfobloxProvider(
+			endpoint.NewDomainFilter([]string{"example.com"}),
+			provider.NewZoneIDFilter([]string{""}), "", false, false, client)
+		if err := providerCfg.ApplyChanges(context.Background(), changes); err != nil {
+			t.Fatalf("ApplyChanges returned an error: %v", err)
+		}
+		if len(client.createdEndpoints) != 1 {
+			t.Fatalf("expected exactly one created record, got %v", client.createdEndpoints)
+		}
+	}
+
+	created := newClient()
+	apply(t, &created, &plan.Changes{Create: []*endpoint.Endpoint{txt()}})
+
+	// Same endpoint, but reached through the upsert: an UPDATE of a record the zone
+	// does not hold. Matched UpdateOld/UpdateNew keeps CountDiff from turning it into
+	// a create of its own.
+	upserted := newClient()
+	apply(t, &upserted, &plan.Changes{
+		UpdateOld: []*endpoint.Endpoint{txt()},
+		UpdateNew: []*endpoint.Endpoint{txt()},
+	})
+
+	if want, got := created.createdEndpoints[0].Targets[0], upserted.createdEndpoints[0].Targets[0]; want != got {
+		t.Errorf("upsert stored %q, a plain create of the same endpoint stores %q", got, want)
+	}
 }

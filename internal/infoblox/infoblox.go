@@ -418,11 +418,31 @@ func (p *Provider) submitChanges(changes []*infobloxChange) error {
 				metrics.ApiCallLatency.WithLabelValues("GetObject").Observe(duration.Seconds())
 				metrics.TotalApiCalls.Inc()
 			case infobloxDelete:
+				if refId == "" {
+					// Nothing in the zone to delete: the desired state is already met.
+					break
+				}
 				_, actionErr = p.client.DeleteObject(refId)
 				duration := time.Since(startTime)
 				metrics.ApiCallLatency.WithLabelValues("DeleteObject").Observe(duration.Seconds())
 				metrics.TotalApiCalls.Inc()
 			case infobloxUpdate:
+				if refId == "" {
+					// Upsert. ExternalDNS does not promise that an UpdateNew record is
+					// already in the zone -- its TXT registry emits the ownership records
+					// for every updated endpoint whether they exist or not -- and the
+					// in-tree providers create what is missing. Rebuild the record in its
+					// create shape: that path sets the View, which Infoblox needs to find
+					// the parent zone and rejects on an update.
+					var createSet infobloxRecordSet
+					if createSet, actionErr = p.recordSet(change.Endpoint, false); actionErr == nil {
+						_, actionErr = p.client.CreateObject(createSet.obj)
+					}
+					duration := time.Since(startTime)
+					metrics.ApiCallLatency.WithLabelValues("CreateObject").Observe(duration.Seconds())
+					metrics.TotalApiCalls.Inc()
+					break
+				}
 				_, actionErr = p.client.UpdateObject(record.obj, refId)
 				duration := time.Since(startTime)
 				metrics.ApiCallLatency.WithLabelValues("UpdateObject").Observe(duration.Seconds())
@@ -714,6 +734,11 @@ func (p *Provider) findReverseZone(zones []*ibclient.ZoneAuth, name string) *ibc
 	return networks[maxMask]
 }
 
+// recordSet looks the endpoint up in Infoblox when getObject is set, so the caller
+// can tell an existing record from an absent one. A lookup that matches nothing is an
+// answer, not a failure: err is a named return, so each branch clears it after the
+// tolerated NotFoundError -- otherwise it leaks out through buildRecord and the change
+// fails with "could not build record: not found".
 func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet infobloxRecordSet, err error) {
 	var ttl uint32
 	var startTime time.Time
@@ -745,6 +770,7 @@ func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet i
 				err = fmt.Errorf("could not fetch A record ['%s':'%s'] : %w", *obj.Name, *obj.Ipv4Addr, err)
 				return
 			}
+			err = nil
 			metrics.ApiCallLatency.WithLabelValues("GetObjectA").Observe(duration.Seconds())
 		} else {
 			// If getObject is not set (action == create), we need to set the View for Infoblox to find the parent zone
@@ -773,6 +799,7 @@ func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet i
 				metrics.FailedApiCallsTotal.Inc()
 				return
 			}
+			err = nil
 			metrics.ApiCallLatency.WithLabelValues("GetObjectPTR").Observe(duration.Seconds())
 
 		} else {
@@ -801,6 +828,7 @@ func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet i
 				metrics.FailedApiCallsTotal.Inc()
 				return
 			}
+			err = nil
 			metrics.ApiCallLatency.WithLabelValues("GetObjectCNAME").Observe(duration.Seconds())
 		} else {
 			// If getObject is not set (action == create), we need to set the View for Infoblox to find the parent zone
@@ -825,6 +853,7 @@ func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet i
 				metrics.FailedApiCallsTotal.Inc()
 				return
 			}
+			err = nil
 			metrics.ApiCallLatency.WithLabelValues("GetObjectNS").Observe(duration.Seconds())
 		} else {
 			// If getObject is not set (action == create), we need to set the View for Infoblox to find the parent zone
@@ -858,6 +887,7 @@ func (p *Provider) recordSet(ep *endpoint.Endpoint, getObject bool) (recordSet i
 				metrics.FailedApiCallsTotal.Inc()
 				return
 			}
+			err = nil
 			metrics.ApiCallLatency.WithLabelValues("GetObjectTXT").Observe(duration.Seconds())
 		} else {
 			// If getObject is not set (action == create), we need to set the View for Infoblox to find the parent zone
